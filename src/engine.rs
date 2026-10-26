@@ -7,7 +7,7 @@ use crate::{
 };
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::sync::Arc;
+use std::{collections::VecDeque, sync::Arc};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
@@ -176,14 +176,141 @@ impl State {
         mut internal: mpsc::Receiver<Internal>,
         cancel: CancellationToken,
     ) {
+        // Preserve FIFO completion of audio mutations without blocking unrelated work.
+        let mut pending = VecDeque::new();
         loop {
+            if cancel.is_cancelled() {
+                break;
+            }
+            if !self.audio.releasing
+                && let Some(request) = pending.pop_front()
+            {
+                self.dispatch(request, &mut pending).await;
+                continue;
+            }
+            let deadline = self.audio.cleanup_deadline();
             tokio::select! {
                 _=cancel.cancelled()=>break,
-                request=requests.recv()=>{let Some(r)=request else{break;};let result=self.handle(r.operation).await;let _=r.reply.send(result);},
+                _=self.audio.finish_release(), if self.audio.releasing => {
+                    self.release_audio().await;
+                    self.repaint();
+                    if self.audio.cleanup_error.is_some() {
+                        self.cleanup_failed(&mut pending);
+                    }
+                },
+                _=async { match deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }} => {
+                    self.audio.cleanup_timed_out();
+                    self.cleanup_failed(&mut pending);
+                },
+                request=requests.recv()=>{
+                    let Some(r)=request else{break;};
+                    // Validate ordered mutations when they reach the front: an earlier
+                    // scene replacement may create/remove the requested component.
+                    let ordered = match &r.operation {
+                        Operation::Activate(_) | Operation::Stop
+                        | Operation::Command(_, Command::Play | Command::Pause | Command::Stop) => Ok(true),
+                        _ => self.audio_ordered(&r.operation),
+                    };
+                    match ordered {
+                        Err(error) => { let _ = r.reply.send(Err(error)); }
+                        Ok(true) if self.audio.quarantined || (self.audio.releasing && self.audio.cleanup_error.is_some()) => {
+                            let _ = r.reply.send(Err(self.audio_error()));
+                        }
+                        Ok(true) if self.audio.releasing || !pending.is_empty() => {
+                            if pending.len() < 64 { pending.push_back(r); }
+                            else { let _ = r.reply.send(Err(Error { status:503, code:"unavailable", message:"audio operation queue full".into() })); }
+                        }
+                        Ok(_) => self.dispatch(r, &mut pending).await,
+                    }
+                },
                 Some(event)=internal.recv()=>self.internal(event),
             }
         }
+        requests.close();
+        drop(pending);
         self.clear().await;
+    }
+    fn audio_error(&self) -> Error {
+        Error {
+            status: 503,
+            code: "unavailable",
+            message: self
+                .audio
+                .cleanup_error
+                .clone()
+                .unwrap_or_else(|| "audio output unavailable".into()),
+        }
+    }
+    fn cleanup_failed(&mut self, pending: &mut VecDeque<Request>) {
+        for request in pending.drain(..) {
+            let _ = request.reply.send(Err(self.audio_error()));
+        }
+        self.emit(
+            "audio.cleanup_error",
+            json!({"owner":self.audio.owner,"error":self.audio.cleanup_error}),
+        );
+    }
+    // Validate before initiating cleanup so invalid requests cannot stop playback.
+    fn audio_ordered(&self, op: &Operation) -> Result<bool, Error> {
+        Ok(match op {
+            Operation::Activate(scene) => {
+                scene.validate().map_err(Error::invalid)?;
+                true
+            }
+            Operation::Stop => true,
+            Operation::Command(id, Command::Play | Command::Pause | Command::Stop) => {
+                let i = self.index(id)?;
+                matches!(self.components[i].spec().kind, Config::Webradio(_))
+            }
+            Operation::Update(id, patch) => {
+                if self.audio.owner.as_ref() != Some(id) {
+                    return Ok(false);
+                }
+                let i = self.index(id)?;
+                let next = patch
+                    .clone()
+                    .apply(self.components[i].spec())
+                    .map_err(Error::invalid)?;
+                component::restart_required(self.components[i].spec(), &next)
+            }
+            _ => false,
+        })
+    }
+    fn needs_release(&self, op: &Operation) -> bool {
+        let Some(owner) = &self.audio.owner else {
+            return false;
+        };
+        match op {
+            Operation::Activate(_) | Operation::Stop | Operation::Update(_, _) => true,
+            Operation::Command(id, Command::Play) => id != owner,
+            Operation::Command(id, Command::Pause | Command::Stop) => id == owner,
+            _ => false,
+        }
+    }
+    async fn dispatch(&mut self, request: Request, pending: &mut VecDeque<Request>) {
+        let ordered = match self.audio_ordered(&request.operation) {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = request.reply.send(Err(error));
+                return;
+            }
+        };
+        if ordered && self.audio.quarantined {
+            let _ = request.reply.send(Err(self.audio_error()));
+            return;
+        }
+        if ordered && self.needs_release(&request.operation) {
+            self.audio.begin_release();
+            if self.audio.releasing {
+                pending.push_front(request);
+                return;
+            }
+        }
+        let result = self.handle(request.operation).await;
+        let _ = request.reply.send(result);
     }
     fn emit(&mut self, name: &str, data: Value) {
         self.sequence += 1;
@@ -374,7 +501,9 @@ impl State {
                 self.emit("component.state_changed", json!({"id":id,"status":status}));
                 Ok(status)
             }
-            Operation::Audio => Ok(json!({"owner":self.audio.owner,"session":self.audio.session})),
+            Operation::Audio => Ok(
+                json!({"owner":self.audio.owner,"session":self.audio.session,"releasing":self.audio.releasing,"error":self.audio.cleanup_error}),
+            ),
             Operation::Server => {
                 let (frames, pixels, error) = if let Some(r) = &self.render {
                     (
@@ -386,7 +515,7 @@ impl State {
                     (0, 0, None)
                 };
                 Ok(
-                    json!({"version":env!("CARGO_PKG_VERSION"),"scene_active":self.active,"components":self.components.len(),"audio_owner":self.audio.owner,"display":self.backend,"display_error":error,"rendered_frames":frames,"rendered_pixels":pixels,"event_sequence":self.sequence}),
+                    json!({"version":env!("CARGO_PKG_VERSION"),"scene_active":self.active,"components":self.components.len(),"audio_owner":self.audio.owner,"audio_releasing":self.audio.releasing,"audio_error":self.audio.cleanup_error,"display":self.backend,"display_error":error,"rendered_frames":frames,"rendered_pixels":pixels,"event_sequence":self.sequence}),
                 )
             }
         }
@@ -415,7 +544,9 @@ impl State {
             return;
         }
         if let Some(session) = session
-            && (self.audio.session != session || self.audio.owner.as_ref() != Some(id))
+            && (self.audio.releasing
+                || self.audio.session != session
+                || self.audio.owner.as_ref() != Some(id))
         {
             return;
         }

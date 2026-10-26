@@ -184,3 +184,298 @@ async fn pipeline_once() {
         .unwrap()
         .unwrap();
 }
+
+// Gate actual Output destruction, so completion cannot be confused with cancellation.
+struct CleanupGate {
+    open: std::sync::Mutex<bool>,
+    wake: std::sync::Condvar,
+    entered: tokio::sync::Notify,
+    panic: bool,
+}
+impl CleanupGate {
+    fn release(&self) {
+        *self.open.lock().unwrap() = true;
+        self.wake.notify_all();
+    }
+}
+struct GatedFactory {
+    counts: Arc<Counts>,
+    next: std::sync::Mutex<Option<Arc<CleanupGate>>>,
+}
+struct GatedSink {
+    sink: Sink,
+    gate: Option<Arc<CleanupGate>>,
+}
+impl OutputFactory for GatedFactory {
+    fn open(&self, _: u32, _: u32) -> Result<Box<dyn Output>> {
+        let n = self.counts.active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.counts.peak.fetch_max(n, Ordering::SeqCst);
+        self.counts.opened.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::new(GatedSink {
+            sink: Sink(self.counts.clone()),
+            gate: self.next.lock().unwrap().take(),
+        }))
+    }
+}
+impl Output for GatedSink {
+    fn write(&mut self, data: &[i16], cancel: &CancellationToken) -> Result<()> {
+        self.sink.write(data, cancel)
+    }
+}
+impl Drop for GatedSink {
+    fn drop(&mut self) {
+        if let Some(gate) = &self.gate {
+            gate.entered.notify_one();
+            let mut open = gate.open.lock().unwrap();
+            while !*open {
+                open = gate.wake.wait(open).unwrap();
+            }
+            drop(open);
+            assert!(!gate.panic, "simulated cleanup panic");
+        }
+    }
+}
+struct Handoff {
+    engine: EngineHandle,
+    task: tokio::task::JoinHandle<()>,
+    server: tokio::task::JoinHandle<()>,
+    stop: CancellationToken,
+    counts: Arc<Counts>,
+    gate: Arc<CleanupGate>,
+    scene: Scene,
+}
+impl Drop for Handoff {
+    fn drop(&mut self) {
+        self.gate.release();
+        self.engine.shutdown();
+        self.stop.cancel();
+    }
+}
+impl Handoff {
+    async fn start(panic: bool) -> Self {
+        let counts = Arc::new(Counts::default());
+        let c = counts.clone();
+        let app = Router::new().route(
+            "/",
+            get(move || stream(include_bytes!("fixtures/tone.mp3"), c.clone())),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stop = CancellationToken::new();
+        let token = stop.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(token.cancelled_owned())
+                .await
+                .unwrap();
+        });
+        let gate = Arc::new(CleanupGate {
+            open: std::sync::Mutex::new(false),
+            wake: std::sync::Condvar::new(),
+            entered: tokio::sync::Notify::new(),
+            panic,
+        });
+        let (engine, task) = Engine::spawn(
+            None,
+            Arc::new(GatedFactory {
+                counts: counts.clone(),
+                next: std::sync::Mutex::new(Some(gate.clone())),
+            }),
+            "test".into(),
+        );
+        let scene: Scene = serde_json::from_value(json!({"schema_version":1,"components":[
+            {"id":"a","type":"webradio","x":0,"y":0,"width":400,"height":200,"config":{"name":"A","stream_url":format!("http://{addr}/")}},
+            {"id":"b","type":"webradio","x":400,"y":0,"width":400,"height":200,"config":{"name":"B","stream_url":format!("http://{addr}/")}}
+        ]})).unwrap();
+        engine
+            .request(Operation::Activate(scene.clone()))
+            .await
+            .unwrap();
+        engine
+            .request(Operation::Command("a".into(), Command::Play))
+            .await
+            .unwrap();
+        wait_state(&engine, "a", "playing").await;
+        Self {
+            engine,
+            task,
+            server,
+            stop,
+            counts,
+            gate,
+            scene,
+        }
+    }
+    async fn finish(&mut self) {
+        self.gate.release();
+        self.engine.shutdown();
+        tokio::time::timeout(Duration::from_secs(3), &mut self.task)
+            .await
+            .unwrap()
+            .unwrap();
+        self.stop.cancel();
+        tokio::time::timeout(Duration::from_secs(3), &mut self.server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(self.counts.active.load(Ordering::SeqCst), 0);
+        assert_eq!(self.counts.connections.load(Ordering::SeqCst), 0);
+        assert_eq!(self.counts.peak.load(Ordering::SeqCst), 1);
+    }
+}
+async fn queued(
+    e: &EngineHandle,
+    op: Operation,
+) -> tokio::task::JoinHandle<Result<serde_json::Value, pi_dashboard::engine::Error>> {
+    let e = e.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let job = tokio::spawn(async move {
+        let mut request = Box::pin(e.request(op));
+        assert!(futures_util::poll!(&mut request).is_pending());
+        tx.send(()).unwrap();
+        request.await
+    });
+    rx.await.unwrap();
+    job
+}
+#[tokio::test]
+async fn slow_cleanup_keeps_status_and_unrelated_updates_responsive_and_claims_fifo() {
+    let mut h = Handoff::start(false).await;
+    let b = queued(&h.engine, Operation::Command("b".into(), Command::Play)).await;
+    h.gate.entered.notified().await;
+    let a = queued(&h.engine, Operation::Command("a".into(), Command::Play)).await;
+    tokio::time::timeout(Duration::from_millis(500), async {
+        assert_eq!(
+            h.engine.request(Operation::Audio).await.unwrap()["releasing"],
+            true
+        );
+        h.engine.request(Operation::Server).await.unwrap();
+        h.engine
+            .request(Operation::Status("b".into()))
+            .await
+            .unwrap();
+        h.engine
+            .request(Operation::Update(
+                "b".into(),
+                serde_json::from_value(json!({"config":{"name":"Renamed"}})).unwrap(),
+            ))
+            .await
+            .unwrap();
+    })
+    .await
+    .unwrap();
+    assert!(!b.is_finished() && !a.is_finished());
+    assert_eq!(h.counts.opened.load(Ordering::SeqCst), 1);
+    h.gate.release();
+    b.await.unwrap().unwrap();
+    a.await.unwrap().unwrap();
+    assert_eq!(
+        h.engine.request(Operation::Audio).await.unwrap()["owner"],
+        "a"
+    );
+    assert_eq!(
+        h.engine
+            .request(Operation::Status("b".into()))
+            .await
+            .unwrap()["state"],
+        "stopped"
+    );
+    h.finish().await;
+}
+#[tokio::test]
+async fn scene_replacement_during_handoff_joins_workers_and_rejects_old_events() {
+    let mut h = Handoff::start(false).await;
+    let b = queued(&h.engine, Operation::Command("b".into(), Command::Play)).await;
+    h.gate.entered.notified().await;
+    let replace = queued(&h.engine, Operation::Activate(h.scene.clone())).await;
+    h.gate.release();
+    b.await.unwrap().unwrap();
+    replace.await.unwrap().unwrap();
+    assert_eq!(h.counts.active.load(Ordering::SeqCst), 0);
+    assert!(h.engine.request(Operation::Audio).await.unwrap()["owner"].is_null());
+    for id in ["a", "b"] {
+        assert_eq!(
+            h.engine
+                .request(Operation::Status(id.into()))
+                .await
+                .unwrap()["state"],
+            "stopped"
+        );
+    }
+    h.finish().await;
+}
+#[tokio::test]
+async fn shutdown_during_handoff_cancels_queued_claim_and_joins_cleanup() {
+    let mut h = Handoff::start(false).await;
+    let b = queued(&h.engine, Operation::Command("b".into(), Command::Play)).await;
+    h.gate.entered.notified().await;
+    h.engine.shutdown();
+    assert_eq!(b.await.unwrap().unwrap_err().status, 503);
+    assert!(!h.task.is_finished());
+    h.finish().await;
+    assert_eq!(h.counts.opened.load(Ordering::SeqCst), 1);
+}
+#[tokio::test]
+async fn cleanup_failure_is_reported_after_all_workers_join() {
+    let mut h = Handoff::start(true).await;
+    let b = queued(&h.engine, Operation::Command("b".into(), Command::Play)).await;
+    h.gate.entered.notified().await;
+    h.gate.release();
+    assert_eq!(b.await.unwrap().unwrap_err().status, 503);
+    let audio = h.engine.request(Operation::Audio).await.unwrap();
+    assert!(
+        audio["error"]
+            .as_str()
+            .unwrap()
+            .contains("output cleanup panicked")
+    );
+    assert!(audio["owner"].is_null());
+    assert_eq!(h.counts.active.load(Ordering::SeqCst), 0);
+    // A joined worker panic is recoverable; an unjoined supervisor panic is not.
+    h.engine
+        .request(Operation::Command("b".into(), Command::Play))
+        .await
+        .unwrap();
+    wait_state(&h.engine, "b", "playing").await;
+    h.finish().await;
+}
+#[tokio::test]
+async fn stuck_cleanup_reports_timeout_keeps_reservation_and_bounds_queue() {
+    let mut h = Handoff::start(false).await;
+    let first = queued(&h.engine, Operation::Command("b".into(), Command::Play)).await;
+    h.gate.entered.notified().await;
+    let mut pending = vec![first];
+    for _ in 1..64 {
+        pending.push(queued(&h.engine, Operation::Command("b".into(), Command::Play)).await);
+    }
+    assert_eq!(
+        h.engine
+            .request(Operation::Command("b".into(), Command::Play))
+            .await
+            .unwrap_err()
+            .status,
+        503
+    );
+    tokio::time::timeout(Duration::from_secs(7), async {
+        for request in pending {
+            assert_eq!(request.await.unwrap().unwrap_err().status, 503);
+        }
+    })
+    .await
+    .unwrap();
+    let audio = h.engine.request(Operation::Audio).await.unwrap();
+    assert_eq!(audio["owner"], "a");
+    assert_eq!(audio["releasing"], true);
+    assert!(audio["error"].as_str().unwrap().contains("five seconds"));
+    assert_eq!(
+        h.engine
+            .request(Operation::Command("b".into(), Command::Play))
+            .await
+            .unwrap_err()
+            .status,
+        503
+    );
+    assert_eq!(h.counts.active.load(Ordering::SeqCst), 1);
+    assert_eq!(h.counts.opened.load(Ordering::SeqCst), 1);
+    h.finish().await;
+}

@@ -5,7 +5,7 @@ use crate::{
 use anyhow::Result;
 use fontdue::{Font, FontSettings, Metrics};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -57,7 +57,14 @@ impl Dirty {
         };
         let mut i = 0;
         while i < self.regions.len() {
-            if rect.intersection(self.regions[i]).is_some() {
+            let other = self.regions[i];
+            // A small per-region allowance pays for traversal/presentation overhead.
+            // Keep sparse crosses and diagonal overlaps separate: paint resets each
+            // clip before compositing, so overlapping clips remain alpha-correct.
+            let area = |r: Rect| u64::from(r.width) * u64::from(r.height);
+            if rect.intersection(other).is_some()
+                && area(rect.union(other)) <= area(rect) + area(other) + 128
+            {
                 rect = rect.union(self.regions.swap_remove(i));
                 i = 0;
             } else {
@@ -74,14 +81,14 @@ impl Dirty {
 struct Glyph {
     metrics: Metrics,
     pixels: Vec<u8>,
-    used: u64,
+    recent: bool,
 }
 pub struct Renderer {
     pub pixels: Vec<u32>,
     font: Font,
     cache: HashMap<(char, u16), Glyph>,
     cache_bytes: usize,
-    clock: u64,
+    eviction: VecDeque<(char, u16)>,
 }
 impl Renderer {
     pub fn new(font_bytes: Vec<u8>) -> Result<Self> {
@@ -91,7 +98,7 @@ impl Renderer {
                 .map_err(anyhow::Error::msg)?,
             cache: HashMap::new(),
             cache_bytes: 0,
-            clock: 0,
+            eviction: VecDeque::new(),
         })
     }
     pub fn paint(&mut self, items: &[RenderItem], regions: &[Rect], phase: u32) {
@@ -247,37 +254,39 @@ impl Renderer {
                             .unwrap_or(0.0);
                     }
                     previous = Some(ch);
-                    self.clock += 1;
                     let key = (ch, size);
                     if !self.cache.contains_key(&key) {
                         let (metrics, pixels) = self.font.rasterize(ch, f32::from(size));
                         while self.cache_bytes + pixels.len() > 4 * 1024 * 1024
                             || self.cache.len() >= 2048
                         {
-                            if let Some(key) = self
-                                .cache
-                                .iter()
-                                .min_by_key(|(_, g)| g.used)
-                                .map(|(k, _)| *k)
-                            {
-                                let old = self.cache.remove(&key).unwrap();
-                                self.cache_bytes -= old.pixels.len();
-                            } else {
+                            // Bounded second-chance clock: hits only set one bit, and
+                            // each pass clears it. No full HashMap minimum search per miss.
+                            let Some(old_key) = self.eviction.pop_front() else {
                                 break;
+                            };
+                            let old = self.cache.get_mut(&old_key).unwrap();
+                            if old.recent {
+                                old.recent = false;
+                                self.eviction.push_back(old_key);
+                            } else {
+                                let old = self.cache.remove(&old_key).unwrap();
+                                self.cache_bytes -= old.pixels.len();
                             }
                         }
+                        self.eviction.push_back(key);
                         self.cache_bytes += pixels.len();
                         self.cache.insert(
                             key,
                             Glyph {
                                 metrics,
                                 pixels,
-                                used: self.clock,
+                                recent: true,
                             },
                         );
                     }
                     let glyph = self.cache.get_mut(&key).unwrap();
-                    glyph.used = self.clock;
+                    glyph.recent = true;
                     let m = glyph.metrics;
                     let left = pen.round() as i32 + m.xmin;
                     let top = baseline - m.ymin - m.height as i32;
@@ -482,6 +491,116 @@ pub fn load_font(path: Option<&str>) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn rect(x: u32, y: u32, width: u32, height: u32) -> Rect {
+        Rect {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+    #[test]
+    fn sparse_cross_and_diagonal_updates_stay_small_and_bounded() {
+        let mut dirty = Dirty::default();
+        dirty.add(rect(0, 100, 1000, 10));
+        dirty.add(rect(500, 0, 10, 1000));
+        assert_eq!(dirty.regions.len(), 2);
+        let area = |regions: &[Rect]| regions.iter().map(|r| r.width * r.height).sum::<u32>();
+        assert_eq!(area(&dirty.regions), 20_000); // old merge: 1,000,000 pixels
+        let mut diagonal = Dirty::default();
+        for i in 0..20 {
+            diagonal.add(rect(i * 40, i * 40, 50, 50));
+        }
+        assert_eq!(area(&diagonal.regions), 50_000); // old merge: 656,100 pixels
+        for i in 0..100 {
+            diagonal.add(rect(i * 10, 1000, 2, 2));
+        }
+        assert!(diagonal.regions.len() <= 64);
+        assert_eq!(diagonal.regions, [Rect::SCREEN]);
+    }
+    #[test]
+    fn overlapping_cost_based_regions_preserve_alpha_and_draw_order() {
+        let font = load_font(None).unwrap();
+        let mut partial = Renderer::new(font.clone()).unwrap();
+        let mut full = Renderer::new(font).unwrap();
+        let mut items = vec![
+            RenderItem {
+                id: "h".into(),
+                rect: rect(0, 100, 1000, 10),
+                generation: 1,
+                revision: 0,
+                animate: false,
+                draws: vec![Draw::Fill(rect(0, 100, 1000, 10), Color(255, 0, 0, 128))],
+            },
+            RenderItem {
+                id: "v".into(),
+                rect: rect(500, 0, 10, 1000),
+                generation: 1,
+                revision: 0,
+                animate: false,
+                draws: vec![Draw::Fill(rect(500, 0, 10, 1000), Color(0, 255, 0, 128))],
+            },
+        ];
+        partial.paint(&items, &[Rect::SCREEN], 0);
+        items[0].draws = vec![Draw::Fill(items[0].rect, Color(0, 0, 255, 128))];
+        items.reverse();
+        let mut dirty = Dirty::default();
+        for item in &items {
+            dirty.add(item.rect);
+        }
+        partial.paint(&items, &dirty.regions, 0);
+        full.paint(&items, &[Rect::SCREEN], 0);
+        assert_eq!(partial.pixels, full.pixels);
+    }
+    fn text_draw(text: String, size: f32) -> Draw {
+        Draw::Text {
+            text,
+            x: 0,
+            y: 0,
+            width: WIDTH,
+            size,
+            color: Color(255, 255, 255, 255),
+            align: Align::Left,
+        }
+    }
+    #[test]
+    fn glyph_cache_reuses_text_and_stays_bounded_under_unicode_size_churn() {
+        let mut renderer = Renderer::new(load_font(None).unwrap()).unwrap();
+        let draw = text_draw("Wetter 12°C · Grüße".into(), 24.0);
+        renderer.draw(&draw, Rect::SCREEN);
+        let entries = renderer.cache.len();
+        let bytes = renderer.cache_bytes;
+        let address = renderer.cache[&('W', 24)].pixels.as_ptr();
+        for _ in 0..100 {
+            renderer.draw(&draw, Rect::SCREEN);
+        }
+        assert_eq!(renderer.cache.len(), entries);
+        assert_eq!(renderer.cache_bytes, bytes);
+        assert_eq!(renderer.cache[&('W', 24)].pixels.as_ptr(), address);
+        // Includes supported Latin/Greek/Cyrillic and missing Unicode glyphs.
+        for size in [8, 24, 64, 128] {
+            for code in 32..1100 {
+                let ch = char::from_u32(code).unwrap();
+                renderer.draw(&text_draw(ch.to_string(), size as f32), rect(0, 0, 1, 1));
+                assert!(renderer.cache.len() <= 2048);
+                assert!(renderer.cache_bytes <= 4 * 1024 * 1024);
+                assert_eq!(renderer.eviction.len(), renderer.cache.len());
+            }
+        }
+        assert_eq!(
+            renderer.cache_bytes,
+            renderer
+                .cache
+                .values()
+                .map(|g| g.pixels.len())
+                .sum::<usize>()
+        );
+        let mut keys = renderer.eviction.iter().collect::<Vec<_>>();
+        keys.sort();
+        keys.dedup();
+        assert_eq!(keys.len(), renderer.cache.len());
+        assert!(keys.iter().all(|key| renderer.cache.contains_key(key)));
+    }
     #[test]
     fn dirty_merge_transitive() {
         let mut d = Dirty::default();

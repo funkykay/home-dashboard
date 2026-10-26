@@ -31,13 +31,17 @@ pub struct Block {
 }
 struct Session {
     cancel: CancellationToken,
-    task: JoinHandle<()>,
+    task: JoinHandle<Result<()>>,
     volume: Arc<AtomicU32>,
 }
 pub struct AudioManager {
     pub owner: Option<String>,
     pub session: u64,
     active: Option<Session>,
+    pub releasing: bool,
+    pub cleanup_error: Option<String>,
+    pub quarantined: bool,
+    deadline: Option<tokio::time::Instant>,
     factory: Arc<dyn output::OutputFactory>,
     client: reqwest::Client,
     events: mpsc::Sender<Internal>,
@@ -52,24 +56,86 @@ impl AudioManager {
             owner: None,
             session: 0,
             active: None,
+            releasing: false,
+            cleanup_error: None,
+            quarantined: false,
+            deadline: None,
             factory,
             client,
             events,
         }
     }
-    /// Only the engine actor calls this: old network, decoder and PCM output have joined before return.
-    pub async fn release(&mut self) -> Option<String> {
-        if let Some(s) = self.active.take() {
-            s.cancel.cancel();
-            if let Err(e) = s.task.await {
-                tracing::error!(error=%e,"audio supervisor failed");
-            }
+    pub fn begin_release(&mut self) {
+        if self.releasing {
+            return;
         }
         self.session = self.session.wrapping_add(1);
-        self.owner.take()
+        if let Some(s) = &self.active {
+            s.cancel.cancel();
+            self.releasing = true;
+            self.cleanup_error = None;
+            self.deadline = Some(tokio::time::Instant::now() + Duration::from_secs(5));
+        }
+    }
+    pub fn cleanup_deadline(&self) -> Option<tokio::time::Instant> {
+        self.deadline
+    }
+    pub fn cleanup_timed_out(&mut self) {
+        self.deadline = None;
+        self.cleanup_error =
+            Some("audio cleanup exceeded five seconds; output is still reserved".into());
+        tracing::error!(
+            "audio cleanup exceeded five seconds; retaining workers and output reservation"
+        );
+    }
+    /// Cancel-safe: the actor polls the stored handle alongside incoming requests.
+    /// Never abort a supervisor: its blocking workers must all be joined.
+    pub async fn finish_release(&mut self) {
+        if !self.releasing {
+            std::future::pending::<()>().await;
+        }
+        let result = (&mut self.active.as_mut().unwrap().task).await;
+        self.active = None;
+        self.releasing = false;
+        self.deadline = None;
+        self.cleanup_error = match result {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(error.to_string()),
+            Err(error) => {
+                // A supervisor panic cannot prove that its child workers joined.
+                self.quarantined = true;
+                Some(format!(
+                    "audio supervisor failed; output quarantined: {error}"
+                ))
+            }
+        };
+        if let Some(error) = &self.cleanup_error {
+            tracing::error!(%error, "audio cleanup failed");
+        }
+    }
+    /// Shutdown/public API waits for actual resource release, with a visible watchdog.
+    pub async fn release(&mut self) -> Option<String> {
+        self.begin_release();
+        if self.releasing
+            && tokio::time::timeout(Duration::from_secs(5), self.finish_release())
+                .await
+                .is_err()
+        {
+            self.cleanup_timed_out();
+            self.finish_release().await;
+        }
+        if self.quarantined {
+            None
+        } else {
+            self.owner.take()
+        }
     }
     pub async fn claim(&mut self, id: String, generation: u64, config: RadioConfig) {
         self.release().await;
+        if self.quarantined {
+            return;
+        }
+        self.cleanup_error = None;
         let cancel = CancellationToken::new();
         let volume = Arc::new(AtomicU32::new(config.volume.to_bits()));
         let ctx = ContextAudio {
@@ -82,9 +148,7 @@ impl AudioManager {
             volume: volume.clone(),
         };
         let token = cancel.clone();
-        let task = tokio::spawn(async move {
-            supervise(ctx, config, token).await;
-        });
+        let task = tokio::spawn(async move { supervise(ctx, config, token).await });
         self.owner = Some(id);
         self.active = Some(Session {
             cancel,
@@ -126,7 +190,11 @@ impl ContextAudio {
         tokio::select! {_=cancel.cancelled()=>{},_=self.events.send(event)=>{}}
     }
 }
-async fn supervise(ctx: ContextAudio, config: RadioConfig, cancel: CancellationToken) {
+async fn supervise(
+    ctx: ContextAudio,
+    config: RadioConfig,
+    cancel: CancellationToken,
+) -> Result<()> {
     let mut retry = Backoff::new(ctx.generation ^ ctx.session.wrapping_mul(7919));
     loop {
         if cancel.is_cancelled() {
@@ -136,7 +204,7 @@ async fn supervise(ctx: ContextAudio, config: RadioConfig, cancel: CancellationT
         let started = std::time::Instant::now();
         let result = attempt(&ctx, &config, &cancel).await;
         if cancel.is_cancelled() {
-            break;
+            return result;
         }
         if started.elapsed() > Duration::from_secs(30) {
             retry.reset();
@@ -148,6 +216,7 @@ async fn supervise(ctx: ContextAudio, config: RadioConfig, cancel: CancellationT
         ctx.state("error", Some(error), &cancel).await;
         tokio::select! {_=cancel.cancelled()=>break,_=tokio::time::sleep(retry.delay())=>{}}
     }
+    Ok(())
 }
 async fn attempt(
     ctx: &ContextAudio,
@@ -189,12 +258,12 @@ async fn attempt(
         Output,
         Cancel,
     }
-    let (finished, result) = loop {
+    let (finished, result, panicked) = loop {
         tokio::select! {
-            _=parent.cancelled()=>break(Finished::Cancel,Ok(())),
-            r=&mut network=>break(Finished::Network,r.context("network task panicked").and_then(|x|x)),
-            r=&mut decoder=>break(Finished::Decoder,r.context("decoder task panicked").and_then(|x|x)),
-            r=&mut output=>break(Finished::Output,r.context("audio output task panicked").and_then(|x|x)),
+            _=parent.cancelled()=>break(Finished::Cancel,Ok(()),false),
+            r=&mut network=>{let panicked=r.is_err();break(Finished::Network,r.context("network task panicked").and_then(|x|x),panicked)},
+            r=&mut decoder=>{let panicked=r.is_err();break(Finished::Decoder,r.context("decoder task panicked").and_then(|x|x),panicked)},
+            r=&mut output=>{let panicked=r.is_err();break(Finished::Output,r.context("audio output task panicked").and_then(|x|x),panicked)},
             r=playing_rx.changed()=>{if r.is_ok(){let playing=*playing_rx.borrow_and_update();ctx.state(if playing{"playing"}else{"buffering"},None,parent).await;}},
             r=metadata_rx.changed()=>{if r.is_ok(){let title=metadata_rx.borrow_and_update().clone();let event=Internal::Metadata{id:ctx.id.clone(),generation:ctx.generation,session:ctx.session,title};tokio::select!{_=parent.cancelled()=>{},_=ctx.events.send(event)=>{}}}},
         }
@@ -206,10 +275,11 @@ async fn attempt(
     }
     // Always join both blocking workers, even if either reports an error.
     let decoded = if !matches!(finished, Finished::Decoder) {
-        decoder
-            .await
-            .context("decoder cleanup panicked")
-            .and_then(|x| x)
+        match decoder.await {
+            Ok(result) if !parent.is_cancelled() => result,
+            Ok(_) => Ok(()), // closing the input may interrupt probing/decoding
+            Err(error) => Err(error).context("decoder cleanup panicked"),
+        }
     } else {
         Ok(())
     };
@@ -222,7 +292,15 @@ async fn attempt(
         Ok(())
     };
     if parent.is_cancelled() {
-        return Ok(());
+        played?;
+        decoded?;
+        // Ring closure can race the parent's cancellation branch during probing.
+        // Preserve task panics and output failures, not the expected input interruption.
+        return if !panicked && matches!(finished, Finished::Network | Finished::Decoder) {
+            Ok(())
+        } else {
+            result
+        };
     }
     // Cancellation of the sibling workers is a consequence, not the cause.
     // Preserve the original failure (in particular an ALSA open/write error).
@@ -359,4 +437,49 @@ fn decode(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn supervisor_panic_quarantines_output_without_claiming_release() {
+        let (events, _rx) = mpsc::channel(1);
+        let mut manager = AudioManager::new(
+            Arc::new(output::NullFactory),
+            reqwest::Client::new(),
+            events,
+        );
+        manager.owner = Some("old".into());
+        manager.active = Some(Session {
+            cancel: CancellationToken::new(),
+            task: tokio::spawn(async {
+                panic!("supervisor panic");
+            }),
+            volume: Arc::new(AtomicU32::new(1.0f32.to_bits())),
+        });
+        assert!(manager.release().await.is_none());
+        assert!(manager.quarantined);
+        assert_eq!(manager.owner.as_deref(), Some("old"));
+        assert!(
+            manager
+                .cleanup_error
+                .as_ref()
+                .unwrap()
+                .contains("quarantined")
+        );
+        manager
+            .claim(
+                "new".into(),
+                1,
+                RadioConfig {
+                    name: "new".into(),
+                    stream_url: "http://127.0.0.1:9/".into(),
+                    volume: 1.0,
+                },
+            )
+            .await;
+        assert_eq!(manager.owner.as_deref(), Some("old"));
+        assert!(manager.active.is_none());
+    }
 }

@@ -7,17 +7,28 @@ Stand: 26. Oktober 2026. Die Prüfung erfolgte auf dem Entwicklungs-Mac und in e
 | Prüfung | macOS AArch64 / Rust 1.98.1 | Linux AArch64 / Rust 1.90.0, Debian Bookworm |
 |---|---|---|
 | `cargo fmt --all -- --check` | bestanden | bestanden |
-| `cargo clippy --all-targets --all-features -- -D warnings` | bestanden | bestanden |
-| `cargo test --all` | 19 Tests bestanden | 21 Tests bestanden |
-| `cargo build --release` | bestanden | bestanden |
+| `cargo clippy --locked --all-targets --all-features -- -D warnings` | bestanden | bestanden |
+| `cargo test --locked --all` | 30 Tests bestanden | 32 Tests bestanden |
+| `cargo build --locked --release` | bestanden | bestanden |
 
-Der Linux-Build führt die Cargo-Operationen zusätzlich mit `--locked` aus. Die zwei zusätzlichen Linux-Tests prüfen die Framebuffer-UAPI-Strukturlayouts/RGB565-Konvertierung und das tatsächliche ALSA-Backend mit dem Softwaregerät `null`. Das ist keine Bestätigung hörbarer HDMI-Ausgabe.
+Beide Builds führen Clippy, Tests und Release-Build mit `--locked` aus. Die zwei zusätzlichen Linux-Tests prüfen die Framebuffer-UAPI-Strukturlayouts/RGB565-Konvertierung und das tatsächliche ALSA-Backend mit dem Softwaregerät `null`. Das ist keine Bestätigung hörbarer HDMI-Ausgabe.
 
 Die Tests umfassen Szenenvalidierung und atomare Ersetzung, ungültige Szenen, partielle Updates ohne Neustart anderer Komponenten, Befehle, konkurrierende Audio-Claims, begrenzte Nachrichtenqueues, verspätete interne Nachrichten, HTTP-Fehler und Requestlimits, SSE einschließlich Überlauf/Verbindungslimits, Wetter-Cache/Retry, ICY-Metadaten, Ringbuffer sowie Dirty-Region-Komposition und ruhenden Renderer.
 
 Der Audio-Integrationstest wiederholt **20 vollständige Durchläufe** mit echten MP3-/AAC-LC-Decodern und lokalen synthetischen HTTP-Streams. Jeder Durchlauf prüft Geräte-Ownership, zustandserhaltendes Update, simulierten Gerätefehler, automatischen Retry, Szenenersetzung und Freigabe von Audio- und Netzwerkressourcen. Dabei darf höchstens ein Test-Ausgabegerät gleichzeitig offen sein.
 
 Ein dabei gefundener Hänger beim Abbruch eines Decoder-Reads wurde behoben: `Interrupted` fordert bei Rust-Leseoperationen einen neuen Versuch an; endgültiger Abbruch verwendet nun `ConnectionAborted`. Der Ringbuffer-Test prüft sowohl `read` als auch `read_exact`. Außerdem schützt ein Cancellation-Drop-Guard die Worker beim Abbruch ihres Supervisors, und ursprüngliche Gerätefehler werden gegenüber nachfolgenden Cleanup-Abbrüchen bevorzugt gemeldet.
+
+## Review-Korrekturen vom 26. Oktober
+
+Alle vier Findings wurden bestätigt und gezielt korrigiert; Architektur und Dependencies bleiben erhalten.
+
+- **Wetter:** Regressionstests halten Standort A im HTTP-Handler fest und weisen nach, dass B nach dem vorgesehenen Request-Abstand unabhängig fertig wird. Gleichzeitige Erfolge und Fehler werden pro Standort geteilt; Abbruch einzelner beziehungsweise aller Interessenten gibt die passenden Ressourcen frei. Die bisherigen Cache-/Response-Limits und Refresh-/Retry-Regeln bleiben erhalten; vier Semaphore-Permits begrenzen die Parallelität, das In-Flight-Verzeichnis bleibt bei maximal 64 Standorten.
+- **Audio:** Ein kontrolliert blockierter Output-Destruktor prüft schnelle Statusabfragen und unabhängige Updates, FIFO-Claims, Szenenersetzung, Shutdown während der Übergabe, Cleanup-Panic und Ressourcenfreigabe. Ein über fünf Sekunden blockierter Destruktor prüft HTTP 503, die begrenzte Warteschlange und die weiterhin reservierte Audioausgabe. Ein separater Test stellt sicher, dass ein Supervisor-Panic neue Claims sperrt. Erwartete Decoder-Read-Abbrüche werden von echten Cleanup-Fehlern unterschieden. Es entstehen keine zusätzlichen Cleanup-Tasks.
+- **Dirty Regions:** Der Merge berücksichtigt Pixelkosten und behält höchstens 64 Regionen. Das Kreuzmuster benötigt 20.000 statt 1.000.000 aktualisierte Pixel, die diagonale Updatefolge 50.000 statt 656.100. Transparenz und Zeichenreihenfolge werden durch Vergleich mit vollständiger Neukomposition geprüft. Das sind reproduzierbare Flächenvergleiche, keine gemessenen Pi-Laufzeitgewinne.
+- **Glyphen:** Wiederholte Texte verwenden vorhandene Bitmaps. Tests mit wechselnden Größen und Unicode prüfen beide Cache-Grenzen sowie die Konsistenz der Verdrängungsstruktur. Second-Chance ersetzt die vollständige Minimumsuche pro Eviction durch amortisiert konstanten Verwaltungsaufwand über Hits und Evictions. Der zusätzliche Ring enthält höchstens 2048 Schlüssel; keine neue Dependency und keine unbeschränkte Zugriffshistorie.
+
+Die bestehenden HTTP-/SSE-, Idle-Renderer- und 20-fachen MP3-/AAC-Pipeline-Tests bleiben erfolgreich. Bei einem dauerhaft blockierten Audiotreiber bleiben Verwaltungsabfragen erreichbar; eine sichere Freigabe kann erst nach tatsächlicher Worker-Beendigung bestätigt werden. Beim Shutdown wird nach fünf Sekunden protokolliert und weiter gejoint; ein permanenter Treiberstillstand kann weiterhin die bestehende systemd-Stopfrist erreichen. Reales HDMI-Cleanup und Pi-Laufzeitmessungen bleiben Bestandteil der Hardware-Abnahme.
 
 ## Zusätzliche Laufzeitprüfungen
 
