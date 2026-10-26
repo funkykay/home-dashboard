@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "components": [
+    {
+      "id": "weather-berlin",
+      "type": "weather",
+      "x": 80,
+      "y": 100,
+      "width": 1080,
+      "height": 560,
+      "config": { "latitude": 52.52, "longitude": 13.405, "refresh_seconds": 900 },
+      "style": { "background": "#152338EE", "text_color": "#F1F5F9", "font_size": 30, "padding": 28 }
+    },
+    {
+      "id": "living-room-radio",
+      "type": "webradio",
+      "x": 1220,
+      "y": 100,
+      "width": 620,
+      "height": 400,
+      "config": { "name": "Mein Webradio", "stream_url": "http://127.0.0.1:8090/tone.mp3", "volume": 0.5 },
+      "style": { "background": "#15352DEE", "accent": "#4ADE80", "font_size": 28, "padding": 24 }
+    }
+  ]
+}

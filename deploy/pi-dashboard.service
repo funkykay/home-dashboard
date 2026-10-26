@@ -1,0 +1,40 @@
+[Unit]
+Description=Direct HDMI dashboard engine
+Wants=network-online.target
+After=network-online.target systemd-udev-settle.service
+Conflicts=getty@tty1.service
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=dashboard
+Group=dashboard
+SupplementaryGroups=audio video render tty
+EnvironmentFile=/etc/pi-dashboard.env
+ExecStart=/usr/local/bin/pi-dashboard
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=15
+StandardInput=tty
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+MemoryMax=256M
+TasksMax=32
+LimitNOFILE=256
+
+[Install]
+WantedBy=multi-user.target

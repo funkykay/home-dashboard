@@ -1,0 +1,13 @@
+FROM rust:1.90.0-bookworm@sha256:3914072ca0c3b8aad871db9169a651ccfce30cf58303e5d6f2db16d1d8a7e58f AS build
+RUN apt-get update && apt-get install -y --no-install-recommends libasound2-dev pkg-config fonts-dejavu-core && rm -rf /var/lib/apt/lists/*
+ENV RUSTUP_TOOLCHAIN=1.90.0
+RUN rustup component add rustfmt clippy
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+COPY tests ./tests
+RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/build/target \
+    cargo fmt --all -- --check && cargo clippy --locked --all-targets --all-features -- -D warnings && timeout 120s cargo test --locked --all && cargo build --locked --release && \
+    mkdir -p /artifact && cp target/release/pi-dashboard /artifact/pi-dashboard && cd /artifact && sha256sum pi-dashboard > pi-dashboard.sha256
+FROM scratch AS artifact
+COPY --from=build /artifact/ /
