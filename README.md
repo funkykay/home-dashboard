@@ -40,6 +40,12 @@ curl -fsS -X POST http://localhost:8080/v1/components/living-room-radio/commands
 
 Die Beispielszene enthält Wetter für Berlin und eine vom Client konfigurierte Loopback-Stream-URL für dieses Testsignal. Für den echten Betrieb die URL durch den gewünschten direkten Radio-Stream ersetzen. Im Server sind keine Sender hinterlegt.
 
+## GitHub-Releases und Updates
+
+Releases werden manuell unter [Actions → Release](https://github.com/funkykay/home-dashboard/actions/workflows/release.yml) auf `main` gestartet. Der Workflow liest die Version aus `Cargo.toml`, prüft Formatierung, Clippy und Tests und baut das ARM64-Installationspaket in der vorhandenen Bookworm-Umgebung. Anschließend veröffentlicht er `vMAJOR.MINOR.PATCH` mit Release Notes, Archiv und SHA-256-Prüfsumme. Zusätzliche GitHub-Secrets sind nicht erforderlich.
+
+Fertige Pakete stehen unter [GitHub Releases](https://github.com/funkykay/home-dashboard/releases). Die [Release-Anleitung](docs/releases.md) beschreibt Versionierung, Erstinstallation und das Update-Skript `home-dashboard-update` einschließlich Rollback. Nach einem Update muss der Client die Szene erneut senden.
+
 ## Linux-AArch64-Release auf dem Mac bauen
 
 ```sh

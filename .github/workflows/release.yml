@@ -1,0 +1,155 @@
+name: Release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+
+    outputs:
+      release_tag: ${{ steps.version.outputs.release_tag }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.90.0
+
+      - name: Resolve and validate version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "Only main can be released." >&2
+            exit 1
+          fi
+
+          if [[ ! -f Cargo.lock ]]; then
+            echo "Cargo.lock must be committed before releasing." >&2
+            exit 1
+          fi
+
+          version="$(
+            cargo +1.90.0 metadata --locked --no-deps --format-version 1 |
+              jq -er '.packages[] | select(.name == "pi-dashboard") | .version'
+          )"
+
+          if [[ ! "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "Expected version format in Cargo.toml: MAJOR.MINOR.PATCH" >&2
+            exit 1
+          fi
+
+          release_tag="v${version}"
+          existing_tag="$(git ls-remote --tags --refs origin "refs/tags/${release_tag}")"
+
+          if [[ -n "$existing_tag" ]]; then
+            echo "Tag already exists: ${release_tag}" >&2
+            exit 1
+          fi
+
+          echo "release_tag=${release_tag}" >> "$GITHUB_OUTPUT"
+          echo "Releasing ${release_tag}"
+
+  build:
+    needs: validate
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Check, test and build ARM64 release
+        run: ./scripts/build-aarch64.sh
+
+      - name: Package release
+        run: |
+          set -euo pipefail
+
+          archive="pi-dashboard-aarch64-unknown-linux-gnu.tar.gz"
+          mkdir -p release-assets
+
+          (
+            cd dist
+            sha256sum --check pi-dashboard.sha256
+          )
+
+          tar -czf "release-assets/${archive}" -C dist \
+            pi-dashboard pi-dashboard.sha256 \
+            pi-dashboard.service pi-dashboard.env install.sh update.sh \
+            examples docs README.md LICENSE
+
+          (
+            cd release-assets
+            sha256sum "$archive" > "${archive}.sha256"
+          )
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-aarch64-unknown-linux-gnu
+          path: release-assets/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs:
+      - validate
+      - build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+
+    permissions:
+      contents: write
+
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
+
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+
+      - name: Verify release assets
+        run: |
+          set -euo pipefail
+
+          archive="pi-dashboard-aarch64-unknown-linux-gnu.tar.gz"
+          test -s "dist/${archive}"
+
+          (
+            cd dist
+            sha256sum --check "${archive}.sha256"
+          )
+
+      - name: Publish GitHub release
+        run: |
+          gh release create "$RELEASE_TAG" \
+            dist/*.tar.gz \
+            dist/*.sha256 \
+            --target "$GITHUB_SHA" \
+            --title "$RELEASE_TAG" \
+            --generate-notes \
+            --latest
